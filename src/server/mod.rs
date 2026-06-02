@@ -42,9 +42,11 @@ pub async fn run_server<T: StorageProvider + Clone>(
     };
 
     let app = create_router::<T>(&app_state).with_state(app_state);
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", config.port)).await?;
+    // Bind via a (host, port) tuple rather than a "host:port" string: ToSocketAddrs
+    // handles IPv4, bare IPv6 literals (e.g. `::`, no brackets), and hostnames.
+    let listener = tokio::net::TcpListener::bind((config.host.as_str(), config.port)).await?;
 
-    tracing::info!("Server running on port {}", config.port);
+    tracing::info!("Server running on {}:{}", config.host, config.port);
     axum::serve(listener, app).await?;
 
     Ok(())

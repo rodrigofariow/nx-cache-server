@@ -64,12 +64,15 @@ export AWS_REGION="us-west-2"
 # Optional
 export S3_ENDPOINT_URL="your-s3-endpoint-url"   # For S3-compatible services like MinIO
 export S3_TIMEOUT="30"                          # S3 operation timeout in seconds (default: 30)
+export HOST="127.0.0.1"                         # Bind address (default: 127.0.0.1, loopback only; use 0.0.0.0 for all interfaces)
 export PORT="3000"                              # Server port (default: 3000)
+export LOG_LEVEL="info"                         # Log verbosity: trace, debug, info, warn, error (default: info)
 ```
 
 ##### Option B: Command Line Arguments
 ```bash
 ./nx-cache-aws \
+  --host "127.0.0.1" \
   --region "your-aws-region" \
   --access-key-id "your-aws-access-key-id" \
   --secret-access-key "your-aws-secret-access-key" \
@@ -78,7 +81,8 @@ export PORT="3000"                              # Server port (default: 3000)
   --endpoint-url "your-s3-endpoint-url" \
   --service-access-token "your-bearer-token" \
   --timeout-seconds 30 \
-  --port 3000
+  --port 3000 \
+  --log-level debug
 ```
 
 ##### Option C: Mixed Configuration
