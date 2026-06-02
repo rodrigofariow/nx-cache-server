@@ -61,7 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Run server
-    tracing::info!("Server starting on port {}", cli.server.port);
+    tracing::info!("Server starting on {}:{}", cli.server.host, cli.server.port);
     if let Err(e) = run_server(storage, &cli.server).await {
         eprintln!();
         eprintln!("Server error: {}", e);

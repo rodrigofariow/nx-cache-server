@@ -61,6 +61,8 @@ The server is generic over `T: StorageProvider`, so adding a backend (GCS/Azure/
 
 Auth failures return `401`. Nx clients connect via `NX_SELF_HOSTED_REMOTE_CACHE_SERVER` + `NX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN` (must equal the server's `--service-access-token`).
 
+**Bind address:** the server binds `--host` / `HOST`, defaulting to `127.0.0.1` (loopback only — not reachable over the network). This is the safe default for the local-per-dev model. Set `--host 0.0.0.0` only for a central/shared deployment, and only behind a TLS-terminating reverse proxy (the server speaks plain HTTP).
+
 ## Logging — important
 
 `tracing-subscriber` is compiled **without the `env-filter` feature** (`Cargo.toml`: `default-features = false, features = ["fmt"]`). Therefore:
@@ -95,3 +97,13 @@ Because these are `info!` events and the subscriber uses `with_max_level`, they 
   `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`
 - Keep the layer boundaries: domain has no AWS/axum imports; backends depend only on the `domain` traits; HTTP concerns stay in `server/`.
 - New config flags go on the relevant clap struct (`ServerConfig` or `AwsStorageConfig`) with both a `long` flag and an `env`, and should be documented in `README.md`.
+
+### Rust rules (apply to every change)
+
+Non-negotiables distilled from the `rust-best-practices` skill (`.agents/skills/rust-best-practices/` — read it for the full rationale and examples):
+
+- **No `unwrap()`/`expect()` outside tests.** Return `Result<T, E>` for fallible ops and propagate with `?`. Use `let … else { return Err(…) }` for expected-absence early returns; `inspect_err`/`map_err` to log-then-transform.
+- **Errors:** `thiserror` for the domain/library error enums (`StorageError`, `ConfigError`, `ServerError`); `anyhow` only in `src/bin/`. Wrap nested errors with `#[from]`.
+- **Borrow over clone.** Take `&str` / `&[T]` / `&T` in params; never `.clone()` in a loop. Derive `Copy` only on small (≤24 B) plain-data types with no heap fields.
+- **Comments explain *why*, not *what*;** `///` doc comments for public APIs. `#[expect(clippy::…)]` with a justifying comment over `#[allow(…)]`.
+- **Gate before done:** `cargo fmt` and `cargo clippy --all-targets -- -D warnings` must be clean. Import order: `std` → external → workspace → `crate`/`super`.
