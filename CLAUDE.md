@@ -33,12 +33,22 @@ cargo test
 
 No `rust-toolchain.toml` is pinned; the release CI uses `rustup update stable`. Release builds are cut **manually** via the `Release` GitHub Action (`workflow_dispatch`, input = version tag like `v1.2.0`), which cross-compiles the 5 targets in `.github/workflows/release.yml` and publishes a GitHub Release.
 
+### Release target compatibility — primary Linux build MUST run on Debian Bookworm
+
+The published primary Linux artifact is **`x86_64-unknown-linux-gnu`** (`nx-cache-aws-<ver>-linux-x86_64`). It is deployed into / run alongside the **`node:24-slim`** image, which is based on **Debian Bookworm (Debian 12, glibc 2.36)**. **This binary MUST NOT require a glibc newer than 2.36**, or it dies at startup with `version 'GLIBC_2.3x' not found`.
+
+glibc is **backward**-compatible only: a binary built against an *older* glibc runs on newer systems, **never the reverse**. So the release binary must be **built against glibc ≤ 2.36**, and it must stay **as optimized as the other targets** (same `--release` profile / LTO — do not trade optimization for compatibility).
+
+- ⚠️ **Current gap:** the workflow builds this target on `ubuntu-latest` (glibc **2.39**) → the artifact will *not* run on Bookworm. Building on a dev machine (newer glibc still) is worse — never `cp` a locally-built binary into a Bookworm container expecting it to run.
+- **Fixes (any one), all preserving full release optimization:** build inside a `debian:bookworm`/`rust:*-bookworm` container; **or** pin that matrix leg to `ubuntu-22.04` (glibc 2.35 ≤ 2.36); **or** use `cargo-zigbuild` with `--target x86_64-unknown-linux-gnu.2.36`.
+- `x86_64-unknown-linux-musl` (fully static, no glibc dep) is an option **only if benchmarked to be as fast** — musl's allocator can regress throughput, and the bar is "as optimized as the other targets".
+
 ## Architecture
 
 Clean three-layer split under `src/`:
 
 - **`domain/`** — storage-agnostic core.
-  - `storage.rs`: the `StorageProvider` trait (`exists` / `store` / `retrieve`) and `StorageError` (`NotFound` / `AlreadyExists` / `OperationFailed`). This is the seam any new backend implements.
+  - `storage.rs`: the `StorageProvider` trait (`exists` / `store` / `retrieve`) and `StorageError` (`NotFound` / `AlreadyExists` / `OperationFailed(String)` — the string carries the backend-specific cause for logging). This is the seam any new backend implements.
   - `config.rs`: `ServerConfig` (clap), `ConfigValidator` trait, `ConfigError` (with rich user-facing messages), and `LogLevel`.
 - **`infra/`** — concrete backends. `aws.rs` holds `AwsStorageConfig` (clap) + `S3Storage` implementing `StorageProvider` over `aws-sdk-s3`.
 - **`server/`** — HTTP layer.
@@ -56,10 +66,12 @@ The server is generic over `T: StorageProvider`, so adding a backend (GCS/Azure/
 | Method | Route | Auth | Behavior |
 |---|---|---|---|
 | `GET`  | `/health` | none | `200 "OK"` |
-| `GET`  | `/v1/cache/{hash}` | Bearer | `200` + `application/octet-stream` body on hit; `404` on miss |
-| `PUT`  | `/v1/cache/{hash}` | Bearer | `202` on store; `409` if the key already exists (cache entries are immutable — never overwritten) |
+| `GET`  | `/v1/cache/{hash}` | Bearer | `200` + `application/octet-stream` body on hit; `404` on miss **or any storage-backend failure (degraded — see below)** |
+| `PUT`  | `/v1/cache/{hash}` | Bearer | `202` on store **(or on any storage-backend failure — degraded no-op)**; `409` if the key already exists (cache entries are immutable — never overwritten) |
 
 Auth failures return `401`. Nx clients connect via `NX_SELF_HOSTED_REMOTE_CACHE_SERVER` + `NX_SELF_HOSTED_REMOTE_CACHE_ACCESS_TOKEN` (must equal the server's `--service-access-token`).
+
+**Graceful degradation — never surface `5xx` to Nx.** Nx aborts the *entire* command on any unexpected status from the cache: a `500` (or a bare `401`) makes it fail with *"Misconfigured remote cache endpoint: Unexpected response status"* **even though the wrapped task itself succeeded**. So `handlers.rs` never returns `5xx` for a storage-backend failure (S3 unreachable / `AccessDenied` / throttled / billing / quota): `GET` degrades to a `404` cache MISS (Nx runs the task locally) and `PUT` degrades to a `202` no-op (the artifact is simply not cached; a later run misses and re-runs). The real cause is logged at `error!` (see Logging). **Trade-off:** a genuinely misconfigured backend (wrong bucket, missing IAM perms, bad creds) is now an *invisible* permanent cache miss to clients — the only signal is the server's `error!` log, so **alert on those logs**. (There is no strict/fail-loud mode flag today; if one is wanted it goes on `ServerConfig`.)
 
 **Bind address:** the server binds `--host` / `HOST`, defaulting to `127.0.0.1` (loopback only — not reachable over the network). This is the safe default for the local-per-dev model. Set `--host 0.0.0.0` only for a central/shared deployment, and only behind a TLS-terminating reverse proxy (the server speaks plain HTTP).
 
@@ -81,11 +93,16 @@ Auth failures return `401`. Nx clients connect via `NX_SELF_HOSTED_REMOTE_CACHE_
 
 Because these are `info!` events and the subscriber uses `with_max_level`, they show at `info`/`debug`/`trace` and are hidden at `warn`/`error`.
 
+Storage-backend failures that get **degraded** (see "Graceful degradation") are logged at **`error!`** instead — so they remain visible at *every* level, including `--log-level error` — and carry the underlying cause (`StorageError::OperationFailed`'s string, built from the S3 error via `aws_sdk_s3::error::DisplayErrorContext`, which walks the source chain so even a timeout/`Connection refused` shows up):
+
+- `cache MISS forced (storage degraded): GET <hash> failed: <cause>; returning 404 …` — `GET` storage failure
+- `cache STORE degraded to no-op: … <hash> … failed: <cause>; returning 202 …` — `PUT` storage failure (existence check or the store itself)
+
 **The `<hash>` is all the server can log — it is *not* the command.** The Nx client only ever sends the opaque task hash in the URL (`/v1/cache/{hash}`); there is no header or body field carrying the target/command. To correlate a hash back to a command you must look client-side (e.g. `NX_VERBOSE_LOGGING=true`). There is no request-logging middleware (e.g. `tower-http::trace`) wired in.
 
 ## Gotchas & known rough edges
 
-- **S3 + missing `s3:ListBucket` IAM permission:** S3 returns `403 AccessDenied` (not `404 NoSuchKey`) for `GetObject`/`HeadObject` on a non-existent key when the caller lacks `s3:ListBucket`. `S3Storage` only maps `NoSuchKey`/`NotFound` → `StorageError::NotFound`; everything else → `OperationFailed` → HTTP `500`. So a cache *miss* surfaces as a 500 unless the IAM policy grants `s3:ListBucket` on the **bucket** ARN (`arn:aws:s3:::bucket`, no `/*`) in addition to `s3:GetObject`/`s3:PutObject` on the **object** ARN (`arn:aws:s3:::bucket/*`).
+- **S3 + missing `s3:ListBucket` IAM permission:** S3 returns `403 AccessDenied` (not `404 NoSuchKey`) for `GetObject`/`HeadObject` on a non-existent key when the caller lacks `s3:ListBucket`. `S3Storage` only maps `NoSuchKey`/`NotFound` → `StorageError::NotFound`; everything else → `OperationFailed`. **With graceful degradation this no longer 500s** — instead every lookup degrades to a `404` miss and every store to a `202` no-op, so the cache *silently never works* (permanent misses, nothing ever stored). The symptom moved from "500 errors" to "caching appears to do nothing"; the `error!` log shows the `403 AccessDenied`. Fix: grant `s3:ListBucket` on the **bucket** ARN (`arn:aws:s3:::bucket`, no `/*`) in addition to `s3:GetObject`/`s3:PutObject` on the **object** ARN (`arn:aws:s3:::bucket/*`).
 - **401 lacks a body/content-type:** `auth_middleware` returns a bare `Err(StatusCode::UNAUTHORIZED)` with no `text/plain` body. Nx may report *"Misconfigured remote cache endpoint: Requests should respond with text/plain on 401s."* (Note: `ServerError::Unauthorized` in `error.rs` *does* set `text/plain`, but the middleware short-circuits before that path.)
 - **Not actually streaming yet:** despite the README's streaming claims, `store` buffers the whole body into a `Vec<u8>` before the S3 `put_object` (see `TODO`s in `handlers.rs` / `infra/aws.rs`). Retrieve does stream.
 - **Nx never caches failed tasks.** If a wrapped task exits non-zero, Nx writes nothing to the remote cache — so "nothing in the cache" can be a failing build, not a cache bug.

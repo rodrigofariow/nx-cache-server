@@ -5,6 +5,7 @@ use aws_config::meta::region::{ProvideRegion, RegionProviderChain};
 use aws_credential_types::provider::future::ProvideCredentials as ProvideCredentialsFuture;
 use aws_sdk_s3::config::timeout::TimeoutConfig;
 use aws_sdk_s3::config::{Credentials, ProvideCredentials};
+use aws_sdk_s3::error::DisplayErrorContext;
 use aws_sdk_s3::operation::get_object::GetObjectError;
 use aws_sdk_s3::operation::head_object::HeadObjectError;
 use aws_sdk_s3::{config::Region, Client, Config as S3Config};
@@ -145,8 +146,7 @@ impl S3Storage {
     pub async fn new(config: &AwsStorageConfig) -> Result<Self, StorageError> {
         // Resolve region once - validation already ensured it exists
         let region = config.region().await.ok_or_else(|| {
-            tracing::error!("AWS_REGION must be set");
-            StorageError::OperationFailed
+            StorageError::OperationFailed("AWS region could not be resolved".to_string())
         })?;
 
         let mut s3_config_builder = S3Config::builder()
@@ -191,10 +191,10 @@ impl StorageProvider for S3Storage {
             Ok(_) => Ok(true),
             Err(e) => match e.into_service_error() {
                 HeadObjectError::NotFound(_) => Ok(false),
-                other => {
-                    tracing::error!("S3 head_object failed: {:?}", other);
-                    Err(StorageError::OperationFailed)
-                }
+                other => Err(StorageError::OperationFailed(format!(
+                    "S3 HeadObject failed: {}",
+                    DisplayErrorContext(other)
+                ))),
             },
         }
     }
@@ -212,7 +212,9 @@ impl StorageProvider for S3Storage {
         // TODO: Implement true streaming for better memory efficiency
         let mut buffer = Vec::new();
         while let Some(chunk) = data.next().await {
-            let chunk = chunk.map_err(|_| StorageError::OperationFailed)?;
+            let chunk = chunk.map_err(|e| {
+                StorageError::OperationFailed(format!("reading upload body failed: {e}"))
+            })?;
             buffer.extend_from_slice(&chunk);
         }
 
@@ -226,8 +228,10 @@ impl StorageProvider for S3Storage {
             .send()
             .await
             .map_err(|e| {
-                tracing::error!("S3 put_object failed: {:?}", e);
-                StorageError::OperationFailed
+                StorageError::OperationFailed(format!(
+                    "S3 PutObject failed: {}",
+                    DisplayErrorContext(e)
+                ))
             })?;
 
         Ok(())
@@ -246,10 +250,10 @@ impl StorageProvider for S3Storage {
             .await
             .map_err(|e| match e.into_service_error() {
                 GetObjectError::NoSuchKey(_) => StorageError::NotFound,
-                other => {
-                    tracing::error!("S3 get_object failed: {:?}", other);
-                    StorageError::OperationFailed
-                }
+                other => StorageError::OperationFailed(format!(
+                    "S3 GetObject failed: {}",
+                    DisplayErrorContext(other)
+                )),
             })?;
 
         // Direct streaming - no buffering

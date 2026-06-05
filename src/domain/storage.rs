@@ -9,8 +9,8 @@ pub enum StorageError {
     NotFound,
     #[error("Object already exists")]
     AlreadyExists,
-    #[error("Storage operation failed")]
-    OperationFailed,
+    #[error("Storage operation failed: {0}")]
+    OperationFailed(String),
 }
 
 #[async_trait]
