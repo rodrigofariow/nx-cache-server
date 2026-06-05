@@ -14,11 +14,23 @@ pub async fn store_artifact<T: StorageProvider>(
 ) -> Result<impl IntoResponse, ServerError> {
     validation::validate_hash(&hash)?;
 
-    if state.storage.exists(&hash).await? {
-        // The Nx client only ever sends the opaque task hash, never the command
-        // that produced it - the hash is the only identifier we can log here.
-        tracing::info!("cache STORE skipped (already cached): {hash}");
-        return Ok((StatusCode::CONFLICT, "Cannot override an existing record"));
+    // The Nx client only ever sends the opaque task hash, never the command that
+    // produced it - the hash is the only identifier we can log here.
+    match state.storage.exists(&hash).await {
+        Ok(true) => {
+            tracing::info!("cache STORE skipped (already cached): {hash}");
+            return Err(StorageError::AlreadyExists.into());
+        }
+        Ok(false) => {}
+        // Storage backend unreachable / denied / throttled. Nx aborts the *entire*
+        // command on any non-202/409 from the cache ("Misconfigured remote cache
+        // endpoint: Unexpected response status"), so we never surface a 5xx: degrade
+        // to a 202 no-op (artifact NOT cached; a later run misses and re-runs). Logged
+        // at error! so it stays visible even at --log-level error.
+        Err(e) => {
+            tracing::error!("cache STORE degraded to no-op: existence check for {hash} failed: {e}; returning 202 (artifact NOT cached) so Nx does not abort the build");
+            return Ok((StatusCode::ACCEPTED, ""));
+        }
     }
 
     // For now, let's use a simpler approach - collect the body into bytes
@@ -31,11 +43,22 @@ pub async fn store_artifact<T: StorageProvider>(
     let cursor = std::io::Cursor::new(bytes);
     let reader_stream = tokio_util::io::ReaderStream::new(cursor);
 
-    state.storage.store(&hash, reader_stream).await?;
-
-    tracing::info!("cache STORE: {hash} ({})", human_size(size));
-
-    Ok((StatusCode::ACCEPTED, ""))
+    match state.storage.store(&hash, reader_stream).await {
+        Ok(()) => {
+            tracing::info!("cache STORE: {hash} ({})", human_size(size));
+            Ok((StatusCode::ACCEPTED, ""))
+        }
+        // Raced with a concurrent PUT between our exists() check and the store.
+        Err(StorageError::AlreadyExists) => {
+            tracing::info!("cache STORE skipped (already cached): {hash}");
+            Err(StorageError::AlreadyExists.into())
+        }
+        // Same degradation rationale as the existence check above.
+        Err(e) => {
+            tracing::error!("cache STORE degraded to no-op: storing {hash} ({}) failed: {e}; returning 202 (artifact NOT cached) so Nx does not abort the build", human_size(size));
+            Ok((StatusCode::ACCEPTED, ""))
+        }
+    }
 }
 
 pub async fn retrieve_artifact<T: StorageProvider>(
@@ -55,8 +78,14 @@ pub async fn retrieve_artifact<T: StorageProvider>(
             tracing::info!("cache MISS: {hash}");
             return Err(StorageError::NotFound.into());
         }
+        // Storage backend unreachable / denied / throttled. Nx aborts the *entire*
+        // command on any non-200/404 from the cache, so we degrade to a cache MISS
+        // (404) and let Nx run the task locally instead of failing the build. The 404
+        // is indistinguishable from a genuine miss to the client by design. Logged at
+        // error! so it stays visible even at --log-level error.
         Err(e) => {
-            return Err(e.into());
+            tracing::error!("cache MISS forced (storage degraded): GET {hash} failed: {e}; returning 404 so Nx runs the task locally instead of failing the build");
+            return Err(StorageError::NotFound.into());
         }
     };
 
