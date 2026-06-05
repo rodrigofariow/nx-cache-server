@@ -323,17 +323,3 @@ async fn put_store_failure_degrades_to_202() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::ACCEPTED);
 }
-
-// TEMPORARY — intentional failure to confirm CI blocks red builds. Reverted
-// immediately once the check is observed to go red.
-#[tokio::test]
-async fn ci_red_build_demo_intentional_failure() {
-    let app = app(MockStorage::new(
-        ExistsResult::Absent,
-        StoreResult::Stored,
-        RetrieveResult::Hit,
-    ));
-    let res = app.oneshot(get("abc123", Some(TOKEN))).await.unwrap();
-    // Real status is 200 OK; asserting 418 to force a test failure.
-    assert_eq!(res.status(), StatusCode::IM_A_TEAPOT);
-}
