@@ -177,6 +177,9 @@ async fn missing_token_is_unauthorized() {
     ));
     let res = app.oneshot(get("abc123", None)).await.unwrap();
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    // Nx requires 401s to carry a text/plain body, not a bare status.
+    assert_eq!(res.headers().get("content-type").unwrap(), "text/plain");
+    assert!(!body_bytes(res).await.is_empty());
 }
 
 #[tokio::test]
@@ -191,6 +194,9 @@ async fn wrong_token_is_unauthorized() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    // Nx requires 401s to carry a text/plain body, not a bare status.
+    assert_eq!(res.headers().get("content-type").unwrap(), "text/plain");
+    assert!(!body_bytes(res).await.is_empty());
 }
 
 // --- hash validation --------------------------------------------------------
