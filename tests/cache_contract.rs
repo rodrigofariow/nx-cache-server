@@ -3,7 +3,7 @@
 //! These pin the status codes Nx depends on — in particular the **graceful
 //! degradation** rules: a storage-backend failure must never surface as a 5xx
 //! (which makes Nx abort the whole command). Instead `GET` degrades to a 404
-//! cache miss and `PUT` degrades to a 202 no-op. The handlers are generic over
+//! cache miss and `PUT` degrades to a 200 no-op. The handlers are generic over
 //! `StorageProvider`, so everything here runs against an in-process mock — no
 //! AWS, no network, no secrets.
 
@@ -258,7 +258,9 @@ async fn get_storage_failure_degrades_to_404() {
 // --- PUT /v1/cache/{hash} ---------------------------------------------------
 
 #[tokio::test]
-async fn put_new_artifact_returns_202() {
+async fn put_new_artifact_returns_200() {
+    // Nx's client treats only 200 as a successful store (202 is "Unexpected
+    // response status" and triggers a retry storm that can abort the build).
     let app = app(MockStorage::new(
         ExistsResult::Absent,
         StoreResult::Stored,
@@ -268,7 +270,7 @@ async fn put_new_artifact_returns_202() {
         .oneshot(put("abc123", Some(TOKEN), b"payload"))
         .await
         .unwrap();
-    assert_eq!(res.status(), StatusCode::ACCEPTED);
+    assert_eq!(res.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -301,8 +303,8 @@ async fn put_store_race_already_exists_returns_409() {
 }
 
 #[tokio::test]
-async fn put_exists_check_failure_degrades_to_202() {
-    // Backend error during the existence check must degrade to a no-op 202.
+async fn put_exists_check_failure_degrades_to_200() {
+    // Backend error during the existence check must degrade to a no-op 200.
     let app = app(MockStorage::new(
         ExistsResult::Fail,
         StoreResult::Stored,
@@ -312,12 +314,12 @@ async fn put_exists_check_failure_degrades_to_202() {
         .oneshot(put("abc123", Some(TOKEN), b"payload"))
         .await
         .unwrap();
-    assert_eq!(res.status(), StatusCode::ACCEPTED);
+    assert_eq!(res.status(), StatusCode::OK);
 }
 
 #[tokio::test]
-async fn put_store_failure_degrades_to_202() {
-    // Backend error during the store itself must degrade to a no-op 202.
+async fn put_store_failure_degrades_to_200() {
+    // Backend error during the store itself must degrade to a no-op 200.
     let app = app(MockStorage::new(
         ExistsResult::Absent,
         StoreResult::Fail,
@@ -327,5 +329,5 @@ async fn put_store_failure_degrades_to_202() {
         .oneshot(put("abc123", Some(TOKEN), b"payload"))
         .await
         .unwrap();
-    assert_eq!(res.status(), StatusCode::ACCEPTED);
+    assert_eq!(res.status(), StatusCode::OK);
 }
