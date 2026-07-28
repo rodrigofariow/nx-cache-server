@@ -19,11 +19,11 @@ pub async fn store_artifact<T: StorageProvider>(
     match state.storage.exists(&hash).await {
         Ok(true) => {
             tracing::info!("cache STORE skipped (already cached): {hash}");
-            // Drain the still-arriving request body before responding. Answering
-            // while the client is mid-upload makes the kernel reset the connection
-            // once hyper drops the unread body, and the Nx client then reports
-            // "Failed to send request" instead of seeing the 409 - large artifacts
-            // would never be storable.
+            // Drain the still-arriving request body before responding. Whether a
+            // client mid-upload sees an early response or a connection reset is
+            // otherwise up to hyper's unread-body heuristics and TCP timing; a
+            // reset makes the Nx client report "Failed to send request" instead
+            // of seeing the 409. Draining makes the outcome deterministic.
             drain_body(body).await;
             return Err(StorageError::AlreadyExists.into());
         }
