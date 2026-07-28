@@ -77,7 +77,9 @@ pub async fn store_artifact<T: StorageProvider>(
 /// we are about to send is the same either way.
 async fn drain_body(body: Body) {
     let mut stream = body.into_data_stream();
-    while tokio_stream::StreamExt::next(&mut stream).await.is_some() {}
+    // Stop at the first error too: an `Err` item is terminal, and polling a body
+    // again after that is unspecified (it may panic or loop).
+    while let Some(Ok(_)) = tokio_stream::StreamExt::next(&mut stream).await {}
 }
 
 pub async fn retrieve_artifact<T: StorageProvider>(
