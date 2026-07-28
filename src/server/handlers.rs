@@ -19,17 +19,24 @@ pub async fn store_artifact<T: StorageProvider>(
     match state.storage.exists(&hash).await {
         Ok(true) => {
             tracing::info!("cache STORE skipped (already cached): {hash}");
+            // Drain the still-arriving request body before responding. Answering
+            // while the client is mid-upload makes the kernel reset the connection
+            // once hyper drops the unread body, and the Nx client then reports
+            // "Failed to send request" instead of seeing the 409 - large artifacts
+            // would never be storable.
+            drain_body(body).await;
             return Err(StorageError::AlreadyExists.into());
         }
         Ok(false) => {}
         // Storage backend unreachable / denied / throttled. Nx aborts the *entire*
-        // command on any non-202/409 from the cache ("Misconfigured remote cache
-        // endpoint: Unexpected response status"), so we never surface a 5xx: degrade
-        // to a 202 no-op (artifact NOT cached; a later run misses and re-runs). Logged
-        // at error! so it stays visible even at --log-level error.
+        // command on any store response other than 200 ("Misconfigured remote cache
+        // endpoint: Unexpected response status") / 409 / 403, so we never surface a
+        // 5xx: degrade to a 200 no-op (artifact NOT cached; a later run misses and
+        // re-runs). Logged at error! so it stays visible even at --log-level error.
         Err(e) => {
-            tracing::error!("cache STORE degraded to no-op: existence check for {hash} failed: {e}; returning 202 (artifact NOT cached) so Nx does not abort the build");
-            return Ok((StatusCode::ACCEPTED, ""));
+            tracing::error!("cache STORE degraded to no-op: existence check for {hash} failed: {e}; returning 200 (artifact NOT cached) so Nx does not abort the build");
+            drain_body(body).await;
+            return Ok((StatusCode::OK, ""));
         }
     }
 
@@ -44,9 +51,12 @@ pub async fn store_artifact<T: StorageProvider>(
     let reader_stream = tokio_util::io::ReaderStream::new(cursor);
 
     match state.storage.store(&hash, reader_stream).await {
+        // The Nx client treats only 200 as a successful store; any other 2xx (202
+        // included) is "Unexpected response status", which makes Nx re-upload every
+        // artifact until its 6 retries are exhausted and then abort the whole build.
         Ok(()) => {
             tracing::info!("cache STORE: {hash} ({})", human_size(size));
-            Ok((StatusCode::ACCEPTED, ""))
+            Ok((StatusCode::OK, ""))
         }
         // Raced with a concurrent PUT between our exists() check and the store.
         Err(StorageError::AlreadyExists) => {
@@ -55,10 +65,19 @@ pub async fn store_artifact<T: StorageProvider>(
         }
         // Same degradation rationale as the existence check above.
         Err(e) => {
-            tracing::error!("cache STORE degraded to no-op: storing {hash} ({}) failed: {e}; returning 202 (artifact NOT cached) so Nx does not abort the build", human_size(size));
-            Ok((StatusCode::ACCEPTED, ""))
+            tracing::error!("cache STORE degraded to no-op: storing {hash} ({}) failed: {e}; returning 200 (artifact NOT cached) so Nx does not abort the build", human_size(size));
+            Ok((StatusCode::OK, ""))
         }
     }
+}
+
+/// Read and discard the rest of a request body, so a response sent before the
+/// client finished uploading never turns into a connection reset on their side.
+/// Errors are ignored - the client may already have hung up, and the response
+/// we are about to send is the same either way.
+async fn drain_body(body: Body) {
+    let mut stream = body.into_data_stream();
+    while tokio_stream::StreamExt::next(&mut stream).await.is_some() {}
 }
 
 pub async fn retrieve_artifact<T: StorageProvider>(
